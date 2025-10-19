@@ -1,4 +1,6 @@
 import os, re, json, time, io
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
@@ -18,22 +20,31 @@ except Exception:
 
 load_dotenv()
 
-# Variables env (mode gratuit)
+# =========================
+# ENV (100% gratuit)
+# =========================
 GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY")
 GOOGLE_CSE_CX  = os.getenv("GOOGLE_CSE_CX")
 PAPPERS_API_KEY = os.getenv("PAPPERS_API_KEY")
-
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Prospects AgenceVille")
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (ProspectFinder/1.1)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (ProspectFinder/1.2)"}
 
+# Footprints FR (élargis)
 FOOTPRINTS = [
-    "site réalisé par", "site realisé par", "propulsé par", "propulse par",
-    "créé par", "cree par", "crédits", "credits", "webmaster", "agence web",
-    "développé par", "developpe par", "design :", "site conçu par"
+    "site réalisé par","site realisé par","site realise par",
+    "propulsé par","propulse par",
+    "créé par","cree par",
+    "crédits","credits",
+    "webmaster","agence web",
+    "développé par","developpe par",
+    "design :","design:",
+    "site conçu par","site concu par",
+    "créateur :","créateur:","createur :","createur:","Créateur :","Créateur:"
 ]
-LEGAL_HINTS = ["crédits", "credits", "mentions légales", "mentions legales", "legal", "impressum"]
+
+LEGAL_HINTS = ["crédits","credits","mentions légales","mentions legales","legal","impressum"]
 
 RE_ADDRESS = re.compile(
     r"(\d{1,4}\s+(?:bis|ter|quater)?\s*[A-Za-zÀ-ÖØ-öø-ÿ'\-\. ]+"
@@ -44,15 +55,18 @@ RE_ADDRESS = re.compile(
 RE_SIREN = re.compile(r"\b(\d{3}\s?\d{3}\s?\d{3})\b")
 RE_SIRET = re.compile(r"\b(\d{3}\s?\d{3}\s?\d{3}\s?\d{5})\b")
 
-# --- UI ---
+# =========================
+# UI
+# =========================
 st.set_page_config(page_title="Prospect Finder – Agence+Ville", page_icon="📇", layout="wide")
 st.title("📇 Prospect Finder – Agence + Ville")
 st.caption("Saisis un nom d'agence et une ville pour trouver les sites gérés par cette agence, avec coordonnées (100% gratuit : Google CSE + Pappers).")
 
 with st.sidebar:
     st.header("⚙️ Options")
-    max_pages = st.slider("Profondeur de recherche (pages CSE)", 1, 5, 3)
+    max_pages = st.slider("Profondeur de recherche (pages CSE)", 1, 10, 3)
     threshold = st.slider("Seuil de correspondance (0-100)", 60, 95, 80)
+    enable_fallback_no_city = st.toggle("Élargir sans la ville (fallback)", value=True)
     use_pappers = st.toggle("Enrichir avec Pappers", value=bool(PAPPERS_API_KEY))
     push_gsheet = st.toggle("Exporter vers Google Sheets", value=False)
     st.markdown("---")
@@ -71,7 +85,13 @@ with col2:
 
 run = st.button("🔍 Scanner", type="primary")
 
-# ---------- Utils ----------
+# Conserver le dernier résultat affiché (évite le “remonte en haut” après download)
+if "last_results" not in st.session_state:
+    st.session_state["last_results"] = None
+
+# =========================
+# Utils
+# =========================
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
@@ -99,7 +119,28 @@ def format_phone_list(text: str):
         out.add(phonenumbers.format_number(match.number, phonenumbers.PhoneNumberFormat.INTERNATIONAL))
     return list(out)
 
-# ---------- Web fetch ----------
+# Validation Luhn (INSEE)
+def luhn_checksum(num: str) -> int:
+    s = 0
+    parity = len(num) % 2
+    for i, ch in enumerate(num):
+        d = int(ch)
+        if i % 2 == parity:
+            d *= 2
+            if d > 9:
+                d -= 9
+        s += d
+    return s % 10
+
+def is_valid_siren(s: str) -> bool:
+    return s.isdigit() and len(s) == 9 and luhn_checksum(s) == 0
+
+def is_valid_siret(s: str) -> bool:
+    return s.isdigit() and len(s) == 14 and luhn_checksum(s) == 0
+
+# =========================
+# Fetch & parse
+# =========================
 def fetch(url: str) -> str:
     try:
         r = requests.get(url, headers=HEADERS, timeout=25)
@@ -118,13 +159,12 @@ def find_legal_links(soup, base_url):
             links.append(absolute_url(base_url, href))
     return list(dict.fromkeys(links))
 
-# ---------- Evidence & parsing ----------
 def contains_agency_proof(html: str, agency: str, thr: int):
     soup = BeautifulSoup(html, "lxml")
     texts = []
     for f in soup.select("footer"):
         texts.append(f.get_text(" "))
-    for sel in ["a", "small", ".credits", "#credits", "#credit"]:
+    for sel in ["a","small",".credits","#credits","#credit"]:
         for el in soup.select(sel):
             texts.append(el.get_text(" "))
     body = soup.get_text(" ")
@@ -137,7 +177,7 @@ def contains_agency_proof(html: str, agency: str, thr: int):
         snippet = joined[max(0, idx-80): idx+120] if idx != -1 else joined[:200]
         return True, norm(snippet)
 
-    # try mentions/crédits pages
+    # Essaye liens "Mentions / Crédits"
     for lnk in find_legal_links(soup, "#"):
         h2 = fetch(lnk)
         if not h2:
@@ -181,16 +221,22 @@ def extract_legal(text: str):
     siren = None; siret = None
     m = RE_SIRET.search(text)
     if m:
-        siret = re.sub(r"\s","", m.group(1))
-        siren = siret[:9]
-    else:
+        siret_cand = re.sub(r"\s","", m.group(1))
+        if is_valid_siret(siret_cand):
+            siret = siret_cand
+            siren = siret[:9]
+    if not siren:
         m2 = RE_SIREN.search(text)
         if m2:
-            siren = re.sub(r"\s","", m2.group(1))
+            siren_cand = re.sub(r"\s","", m2.group(1))
+            if is_valid_siren(siren_cand):
+                siren = siren_cand
+
     addr = None
     m3 = RE_ADDRESS.search(text)
     if m3:
         addr = norm(m3.group(1))
+
     manager = None
     mm = re.search(r"(Directeur(?:rice)? de publication|Gérant|Gerant|Président|President)\s*[:\-–]\s*([A-Za-zÀ-ÖØ-öø-ÿ' \-\.]+)", text, re.IGNORECASE)
     if mm:
@@ -228,7 +274,9 @@ def pappers_enrich(siren: str):
         pass
     return {}
 
-# ---------- Search (gratuit) ----------
+# =========================
+# Search (CSE gratuit)
+# =========================
 @st.cache_data(show_spinner=False)
 def cse_search(agency: str, city: str, max_pages: int = 3):
     results = []
@@ -240,7 +288,7 @@ def cse_search(agency: str, city: str, max_pages: int = 3):
             params = {
                 "key": GOOGLE_CSE_KEY,
                 "cx": GOOGLE_CSE_CX,
-                "q": f'"{fp}" "{agency}" "{city}"',
+                "q": f'"{fp}" "{agency}" "{city}"' if city else f'"{fp}" "{agency}"',
                 "num": 10,
                 "start": start,
                 "hl": "fr"
@@ -255,8 +303,8 @@ def cse_search(agency: str, city: str, max_pages: int = 3):
                 start += 10
             except Exception:
                 pass
-            time.sleep(0.8)
-    # dédup
+            time.sleep(0.7)
+    # dédup url
     seen=set(); uniq=[]
     for r in results:
         if r["url"] and r["url"] not in seen:
@@ -264,12 +312,23 @@ def cse_search(agency: str, city: str, max_pages: int = 3):
     return uniq
 
 @st.cache_data(show_spinner=False)
-def search_candidates(agency: str, city: str, max_pages: int = 3):
-    return cse_search(agency, city, max_pages)
+def search_candidates(agency: str, city: str, max_pages: int = 3, enable_fallback: bool=True):
+    # cible: agence + ville
+    res = cse_search(agency, city, max_pages)
+    # fallback: agence sans ville (on filtrera ensuite)
+    if enable_fallback and len(res) < 20:
+        res += cse_search(agency, "", max_pages)
+    # dédup final
+    seen=set(); uniq=[]
+    for r in res:
+        if r["url"] and r["url"] not in seen:
+            uniq.append(r); seen.add(r["url"])
+    return uniq
 
-# ---------- Scan ----------
-@st.cache_data(show_spinner=False)
-def scan_once(url: str, agency: str, thr: int = 80):
+# =========================
+# Scan d'une URL
+# =========================
+def scan_once(url: str, agency: str, thr: int = 80, city_filter: str = ""):
     html = fetch(url)
     if not html:
         return None
@@ -277,13 +336,25 @@ def scan_once(url: str, agency: str, thr: int = 80):
     if not ok:
         return None
 
+    # Filtre ville (si fallback sans ville a ramené des candidats)
+    if city_filter and (city_filter.lower() not in html.lower()):
+        soup = BeautifulSoup(html, "lxml")
+        keep = False
+        for lnk in find_legal_links(soup, url):
+            h2 = fetch(lnk)
+            if h2 and city_filter.lower() in h2.lower():
+                keep = True
+                break
+        if not keep:
+            return None
+
     phones = format_phone_list(html)
     org = parse_jsonld_org(html)
     siren, siret, addr, manager = extract_legal(html)
 
     tel = org.get("tel") if org.get("tel") else (phones[0] if phones else None)
     addr_guess = addr or norm(" ".join(filter(None, [org.get("street"), org.get("postalCode"), org.get("city")])))
-    pap = pappers_enrich(siren)
+    pap = pappers_enrich(siren) if PAPPERS_API_KEY else {}
     dirigeants = pap.get("dirigeants") or manager
     final_addr = pap.get("adresse_officielle") or addr_guess
     legal_name = pap.get("denomination") or org.get("name")
@@ -292,7 +363,7 @@ def scan_once(url: str, agency: str, thr: int = 80):
     if proof: score += 40
     if tel: score += 20
     if final_addr: score += 15
-    if siren or siret: score += 15
+    if (siren or siret): score += 15
     if dirigeants: score += 10
 
     domain = extract_domain(url)
@@ -310,23 +381,36 @@ def scan_once(url: str, agency: str, thr: int = 80):
         "score": score
     }
 
+# =========================
+# Exécution (parallélisée)
+# =========================
 @st.cache_data(show_spinner=True)
-def run_scan(agency: str, city: str, max_pages: int, thr: int):
-    cands = search_candidates(agency, city, max_pages)
+def run_scan(agency: str, city: str, max_pages: int, thr: int, enable_fallback: bool):
+    cands = search_candidates(agency, city, max_pages, enable_fallback)
     rows = []
     seen_domains = set()
-    for it in cands:
-        rec = scan_once(it["url"], agency, thr)
-        if not rec:
-            continue
-        if rec["domaine"] in seen_domains:
-            continue
-        seen_domains.add(rec["domaine"])
-        rows.append(rec)
+
+    def work(item):
+        try:
+            return scan_once(item["url"], agency, thr, city_filter=city)
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futures = [ex.submit(work, it) for it in cands]
+        for fut in as_completed(futures):
+            rec = fut.result()
+            if not rec:
+                continue
+            if rec["domaine"] in seen_domains:
+                continue
+            seen_domains.add(rec["domaine"])
+            rows.append(rec)
+
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values(by=["score","domaine"], ascending=[False, True])
-    return df
+    return df, len(cands)
 
 def push_to_gsheet(df: pd.DataFrame, sheet_name: str):
     if not (HAS_GS and GOOGLE_SERVICE_ACCOUNT_JSON):
@@ -355,7 +439,9 @@ def push_to_gsheet(df: pd.DataFrame, sheet_name: str):
         st.error(f"Erreur Google Sheets: {e}")
         return False
 
-# ---------- Run ----------
+# =========================
+# Run button
+# =========================
 if run:
     if not (agency and city):
         st.warning("Saisis l'agence et la ville.")
@@ -365,26 +451,34 @@ if run:
         st.stop()
 
     with st.spinner("Recherche en cours…"):
-        df = run_scan(agency, city, max_pages, threshold)
+        df, nb_cands = run_scan(agency, city, max_pages, threshold, enable_fallback_no_city)
 
     if df is None or df.empty:
-        st.info("Aucun site trouvé avec preuve suffisante. Essaie une autre orthographe ou augmente la profondeur.")
+        st.info(f"Aucun site trouvé avec preuve suffisante. (Candidats CSE: {nb_cands})")
     else:
-        st.success(f"{len(df)} site(s) trouvé(s).")
-        st.dataframe(df, use_container_width=True)
+        st.success(f"{len(df)} site(s) trouvé(s) • {nb_cands} URL(s) candidates avant filtrage.")
+        st.session_state["last_results"] = df
 
-        # Téléchargements
-        csv_bytes = df.to_csv(index=False).encode("utf-8")
-        xlsx_buf = io.BytesIO()
-        with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Prospects")
+# =========================
+# Affichage persistant (évite le scroll au top après download)
+# =========================
+df_to_show = st.session_state.get("last_results")
+if df_to_show is not None and not df_to_show.empty:
+    st.dataframe(df_to_show, use_container_width=True)
 
-        st.download_button("⬇️ Télécharger CSV", data=csv_bytes, file_name="prospects.csv", mime="text/csv")
-        st.download_button("⬇️ Télécharger Excel", data=xlsx_buf.getvalue(),
-                           file_name="prospects.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    # Téléchargements (pas de retour haut car on réaffiche df_to_show après rerun)
+    csv_bytes = df_to_show.to_csv(index=False).encode("utf-8")
+    xlsx_buf = io.BytesIO()
+    with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
+        df_to_show.to_excel(writer, index=False, sheet_name="Prospects")
 
-        if push_gsheet:
-            ok = push_to_gsheet(df, GOOGLE_SHEET_NAME)
-            if ok: st.toast("Exporté vers Google Sheets ✅")
-            else:  st.toast("Échec export Google Sheets ❌")
+    st.download_button("⬇️ Télécharger CSV", data=csv_bytes, file_name="prospects.csv", mime="text/csv")
+    st.download_button("⬇️ Télécharger Excel",
+                       data=xlsx_buf.getvalue(),
+                       file_name="prospects.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    if push_gsheet:
+        ok = push_to_gsheet(df_to_show, GOOGLE_SHEET_NAME)
+        if ok: st.toast("Exporté vers Google Sheets ✅")
+        else:  st.toast("Échec export Google Sheets ❌")
